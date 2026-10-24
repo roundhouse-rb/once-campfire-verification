@@ -185,6 +185,8 @@ struct Stats {
     unread_notices: AtomicU64,
     refreshes: AtomicU64,
     rejected: AtomicU64,
+    /// Subscribe commands sent again because no confirmation came within 500 ms.
+    resubscribes: AtomicU64,
     presence_writes: AtomicU64,
 }
 
@@ -285,6 +287,8 @@ struct Viewer {
     heartbeat: Notify,
     /// Failed checks and errors this viewer's requests have had: a navigation failed if its own count moved.
     failures: AtomicU64,
+    /// Subscribe commands awaiting confirmation, with when each was last sent.
+    pending: Mutex<HashMap<String, Instant>>,
     ws: tokio::sync::Mutex<Option<futures_util::stream::SplitSink<WsStream, WsMessage>>>,
 }
 
@@ -322,6 +326,7 @@ struct Ctx {
     fanout: Fanout,
     viewers: Vec<Arc<Viewer>>,
     seq: AtomicU64,
+    stopping: AtomicBool,
     member_rooms: HashMap<u64, HashSet<u64>>, // user -> rooms
 }
 
@@ -680,6 +685,7 @@ impl Ctx {
                 leave.push(stream_identifier("RoomMessagesChannel", &n));
             }
             for ident in leave {
+                v.pending.lock().unwrap().remove(&ident);
                 self.ws_send(v, json!({"command": "unsubscribe", "identifier": ident}).to_string()).await;
             }
         }
@@ -688,6 +694,7 @@ impl Ctx {
             join.push(stream_identifier("RoomMessagesChannel", &n));
         }
         for ident in join {
+            v.pending.lock().unwrap().insert(ident.clone(), Instant::now());
             self.ws_send(v, json!({"command": "subscribe", "identifier": ident}).to_string()).await;
         }
         self.stats.presence_writes.fetch_add(1, Ordering::Relaxed);
@@ -808,11 +815,15 @@ async fn read_socket(ctx: Arc<Ctx>, v: Arc<Viewer>, mut rx: futures_util::stream
         }
         if text.contains("reject_subscription") {
             ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                v.pending.lock().unwrap().remove(value["identifier"].as_str().unwrap_or(""));
+            }
             continue;
         }
         if text.contains("confirm_subscription") {
             let Ok(value) = serde_json::from_str::<Value>(text) else { continue };
             let ident = value["identifier"].as_str().unwrap_or("");
+            v.pending.lock().unwrap().remove(ident);
             if ident == heartbeat {
                 v.heartbeat.notify_one();
             } else if ident.contains("RoomMessagesChannel") {
@@ -848,11 +859,42 @@ async fn open_socket(ctx: &Arc<Ctx>, v: &Arc<Viewer>, subs: Vec<String>) -> Res<
     let (ws, _) = tokio_tungstenite::client_async(req, stream).await?;
     let (mut tx, rx) = ws.split();
     for ident in subs {
+        v.pending.lock().unwrap().insert(ident.clone(), Instant::now());
         tx.send(WsMessage::text(json!({"command": "subscribe", "identifier": ident}).to_string())).await?;
     }
     *v.ws.lock().await = Some(tx);
     tokio::spawn(read_socket(ctx.clone(), v.clone(), rx));
+    tokio::spawn(guarantee_subscriptions(ctx.clone(), v.clone()));
     Ok(())
+}
+
+/// As Action Cable's JavaScript SubscriptionGuarantor does: a subscribe that is not confirmed within 500 ms is sent
+/// again until it is. A server may run one connection's commands concurrently, so `unsubscribe X` followed by
+/// `subscribe X` (a page moving to another room keeps its HeartbeatChannel) can be applied out of order; Rails then
+/// answers the subscribe with AlreadySubscribedError and no confirmation, and browsers recover by resending.
+async fn guarantee_subscriptions(ctx: Arc<Ctx>, v: Arc<Viewer>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    while !ctx.stopping.load(Ordering::Relaxed) {
+        tick.tick().await;
+        let due: Vec<String> = {
+            let mut pending = v.pending.lock().unwrap();
+            let now = Instant::now();
+            let due: Vec<String> = pending
+                .iter()
+                .filter(|(_, sent)| now.duration_since(**sent) >= Duration::from_millis(500))
+                .map(|(i, _)| i.clone())
+                .collect();
+            for ident in &due {
+                pending.insert(ident.clone(), now);
+            }
+            due
+        };
+        for ident in due {
+            if ctx.ws_send(&v, json!({"command": "subscribe", "identifier": ident}).to_string()).await {
+                ctx.stats.resubscribes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Arrival: the room page, the sidebar frame and the socket with the page's subscriptions. Untimed but checked.
@@ -942,6 +984,7 @@ pub async fn users(a: &Args) -> Res<Value> {
                 state: Mutex::new(ViewerState::default()),
                 heartbeat: Notify::new(),
                 failures: AtomicU64::new(0),
+                pending: Mutex::new(HashMap::new()),
                 ws: tokio::sync::Mutex::new(None),
             })
         })
@@ -970,11 +1013,13 @@ pub async fn users(a: &Args) -> Res<Value> {
             refreshes: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             presence_writes: AtomicU64::new(0),
+            resubscribes: AtomicU64::new(0),
         },
         known: Mutex::new(Known { room_of, newest: HashMap::new(), deferred: Vec::new(), audit: Vec::new(), unacknowledged: Vec::new() }),
         fanout: Fanout { posts: Mutex::new(HashMap::new()) },
         viewers: viewers.clone(),
         seq: AtomicU64::new(1),
+        stopping: AtomicBool::new(false),
         member_rooms,
         plan,
     });
@@ -1197,6 +1242,7 @@ pub async fn users(a: &Args) -> Res<Value> {
     }
     tokio::time::sleep(Duration::from_secs(10)).await;
     stop.store(true, Ordering::Relaxed);
+    ctx.stopping.store(true, Ordering::Relaxed);
 
     // Deliveries: every expected viewer received each post, unless it left the room first.
     let mut missing = 0u64;
@@ -1329,6 +1375,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         "invalid": invalid,
         "missing_deliveries": missing,
         "rejected_subscriptions": rejected,
+        "resubscribes": ctx.stats.resubscribes.load(Ordering::Relaxed),
         "unfinished_viewers": unfinished,
         "unread_notices": ctx.stats.unread_notices.load(Ordering::Relaxed),
         "presence_refreshes": ctx.stats.refreshes.load(Ordering::Relaxed),
