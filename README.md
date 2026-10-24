@@ -1,3 +1,11 @@
+> [!NOTE]
+> **This is a fork of [basecamp/once-campfire-verification](https://github.com/basecamp/once-campfire-verification), not the official repository.**
+> It is not affiliated with or endorsed by Basecamp or 37signals.
+>
+> The `preview` branch is upstream plus pull requests that have been submitted upstream but not yet
+> merged, so they can be used together while they wait for review. Every change here is meant to go
+> upstream, and leaves this branch once it is merged there. `main` is an unmodified copy of upstream.
+
 # once-campfire-verification
 
 Shared verification and benchmarks for [Campfire](https://github.com/basecamp/once-campfire) and its Django, Laravel, Express, Elixir, Go, Rust, C and C++ implementations.
