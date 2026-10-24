@@ -13,6 +13,7 @@
 //!   loadgen upload --base URL --cookie C --room ID --csrf T --file PATH [--reps 5]
 //!   loadgen fetch  --base URL --cookie C --path P --out FILE     -> saves an uncompressed body
 //!   loadgen gzip   --file F [--iters 200]                         -> CPU per compression, by backend/level
+//!   loadgen users  --base URL --plan FILE --viewers N --rates R1,R2 -> many people browsing and posting (users.rs)
 //!
 //! `http` also takes `--gzip 0` (`Accept-Encoding: identity`), `--requests N` (stop after N requests,
 //! for allocation counting) and `--trace FILE` (each request's start, latency and status). `cable` prints `PHASE <name> <unix ms>` lines on stderr so memory
@@ -32,6 +33,7 @@
 //! desktop Chrome: `--user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 //! (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'` (one line).
 
+mod users;
 mod validation;
 
 use std::collections::{HashMap, HashSet};
@@ -1301,7 +1303,8 @@ async fn main() {
         "upload" => upload(&a).await,
         "fetch" => fetch(&a).await,
         "gzip" => gzip_cost(&a),
-        _ => Err("usage: loadgen login|scrape|http|cable|upload|fetch|gzip --base URL ...".into()),
+        "users" => users::users(&a).await,
+        _ => Err("usage: loadgen login|scrape|http|cable|upload|fetch|gzip|users --base URL ...".into()),
     };
     match out {
         Ok(v) => println!("{v}"),

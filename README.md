@@ -33,6 +33,20 @@ POST benchmark. Reader and writer measurements stay separate in `mixed-summary.j
 they do not enter the headline table. This tests cache invalidation under writes, not
 sustained chat capacity. See the [source architecture inventory](docs/architecture.md).
 
+`loadgen users` measures many distinct people instead of one viewer. Each person holds an Action Cable
+socket with the page's subscriptions and navigates on an open loop: visiting rooms (whose presence
+subscription writes the membership), scrolling back, searching and returning to a hidden tab, while
+messages are posted into the rooms people are reading. `--people 500,1000,2000` grows the population
+step by step at a per-person pace (`--think-secs`, `--post-secs`) and reports the largest population
+whose p99 navigation and p99 delivery stay within their targets; `--viewers N --rates R1,R2` is a
+fixed-population stress ramp instead. Every response must name its viewer and list only that
+viewer's rooms and messages, a room page must include the newest message acknowledged before it was
+requested, every post must reach every viewer then in the room, and `--db` audits every acknowledged
+write. Latency runs from when each action was dispatched. Responses carrying
+`Server-Timing: page;desc="hit"` or `fragments;desc="hits=N misses=M"` are tallied per route, so hits
+and renders are reported separately. The plan file names each person's signed session cookie and
+rooms and every room's message ids; see the header of `loadgen/src/users.rs`.
+
 Against a **fresh, disposable** running app:
 
 ```sh
