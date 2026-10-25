@@ -38,7 +38,7 @@
 
 use super::*;
 use flate2::read::GzDecoder;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use tokio::sync::{Notify, mpsc};
 
@@ -177,11 +177,14 @@ struct Step {
     delivery: Option<Histogram<u64>>,
     expected_deliveries: u64,
     delivered: u64,
+    /// Requests that got no response, by route and reason.
+    errors: BTreeMap<String, u64>,
 }
 
 struct Stats {
     steps: Vec<Mutex<Step>>,
     invalid_samples: Mutex<Vec<(String, String)>>,
+    error_samples: Mutex<Vec<(String, String)>>,
     invalid: AtomicU64,
     errors: AtomicU64,
     unread_notices: AtomicU64,
@@ -205,10 +208,19 @@ impl Stats {
             samples.push((kind, format!("{route} user {user}: {why}")));
         }
     }
-    fn error(&self, step: Option<usize>, route: &'static str) {
+    /// `kind` is the reason without details that vary (it names the error's tally); `detail` goes in samples.
+    fn error(&self, step: Option<usize>, route: &'static str, user: u64, kind: String, detail: String) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+        let kind = format!("{route}: {kind}");
         if let Some(s) = step {
-            self.steps[s].lock().unwrap().routes.entry(route).or_default().errors += 1;
+            let mut step = self.steps[s].lock().unwrap();
+            step.routes.entry(route).or_default().errors += 1;
+            *step.errors.entry(kind.clone()).or_default() += 1;
+        }
+        let mut samples = self.error_samples.lock().unwrap();
+        if samples.iter().filter(|(k, _)| *k == kind).count() < 5 && samples.len() < 100 {
+            let at = step.map_or("arrival".to_string(), |s| format!("step {s}"));
+            samples.push((kind.clone(), format!("{kind} (user {user}, {at}, {detail})")));
         }
     }
 }
@@ -405,9 +417,9 @@ impl Ctx {
         self.stats.invalid(step, route, v.user, why);
     }
 
-    fn error(&self, v: &Viewer, step: Option<usize>, route: &'static str) {
+    fn error(&self, v: &Viewer, step: Option<usize>, route: &'static str, kind: String, detail: String) {
         v.failures.fetch_add(1, Ordering::Relaxed);
-        self.stats.error(step, route);
+        self.stats.error(step, route, v.user, kind, detail);
     }
 
     fn headers(&self, v: &Viewer, accept: &str, frame: Option<&str>) -> Vec<(&'static str, String)> {
@@ -453,11 +465,15 @@ impl Ctx {
         want_status: u16,
         a: &Action,
     ) -> Option<(String, Resp)> {
+        // A reused keep-alive connection can be closed by the server just as a request is sent on it.
+        let reused = conn.is_some();
         if conn.is_none() {
+            let started = Instant::now();
             match connect(&self.addr).await {
                 Ok(c) => *conn = Some(c),
-                Err(_) => {
-                    self.error(v, a.step, route);
+                Err(e) => {
+                    let detail = format!("{path} after {} ms", started.elapsed().as_millis());
+                    self.error(v, a.step, route, format!("connect failed: {e}"), detail);
                     return None;
                 }
             }
@@ -468,9 +484,11 @@ impl Ctx {
         let done = Instant::now();
         let r = match result {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
                 *conn = None;
-                self.error(v, a.step, route);
+                let connection = if reused { "a reused" } else { "a new" };
+                let detail = format!("{method} {path} after {} ms", (done - sent).as_millis());
+                self.error(v, a.step, route, format!("{e} on {connection} connection"), detail);
                 return None;
             }
         };
@@ -1009,6 +1027,7 @@ pub async fn users(a: &Args) -> Res<Value> {
                 })
                 .collect(),
             invalid_samples: Mutex::new(Vec::new()),
+            error_samples: Mutex::new(Vec::new()),
             invalid: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             unread_notices: AtomicU64::new(0),
@@ -1340,6 +1359,7 @@ pub async fn users(a: &Args) -> Res<Value> {
                 "meets_delivery_slo": delivery_ok,
                 "meets_slo": navigation_ok && delivery_ok,
                 "routes": routes,
+                "errors": s.errors,
                 "delivery": {
                     "expected": s.expected_deliveries,
                     "received": s.delivered,
@@ -1391,6 +1411,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         "unacknowledged_posts": ctx.known.lock().unwrap().unacknowledged.len(),
         "db_audit": db_audit,
         "invalid_samples": samples,
+        "error_samples": ctx.stats.error_samples.lock().unwrap().iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(),
     }))
 }
 
