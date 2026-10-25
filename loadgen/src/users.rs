@@ -192,6 +192,8 @@ struct Stats {
     rejected: AtomicU64,
     /// Subscribe commands sent again because no confirmation came within 500 ms.
     resubscribes: AtomicU64,
+    /// Keep-alive connections found closed by the server before a request was sent, and replaced.
+    reconnects: AtomicU64,
     presence_writes: AtomicU64,
 }
 
@@ -465,7 +467,13 @@ impl Ctx {
         want_status: u16,
         a: &Action,
     ) -> Option<(String, Resp)> {
-        // A reused keep-alive connection can be closed by the server just as a request is sent on it.
+        // A keep-alive connection the server has since closed (an idle timeout, say) is replaced before
+        // use, as a browser does, rather than counted as an error. It can still close just as a request
+        // is sent on it; that is an error, noted as being on a reused connection.
+        if conn.as_ref().is_some_and(|c| c.is_closed()) {
+            *conn = None;
+            self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
+        }
         let reused = conn.is_some();
         if conn.is_none() {
             let started = Instant::now();
@@ -1035,6 +1043,7 @@ pub async fn users(a: &Args) -> Res<Value> {
             rejected: AtomicU64::new(0),
             presence_writes: AtomicU64::new(0),
             resubscribes: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
         },
         known: Mutex::new(Known { room_of, newest: HashMap::new(), deferred: Vec::new(), audit: Vec::new(), unacknowledged: Vec::new() }),
         fanout: Fanout { posts: Mutex::new(HashMap::new()) },
@@ -1403,6 +1412,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         "missing_deliveries": missing,
         "rejected_subscriptions": rejected,
         "resubscribes": ctx.stats.resubscribes.load(Ordering::Relaxed),
+        "reconnects": ctx.stats.reconnects.load(Ordering::Relaxed),
         "unfinished_viewers": unfinished,
         "unread_notices": ctx.stats.unread_notices.load(Ordering::Relaxed),
         "presence_refreshes": ctx.stats.refreshes.load(Ordering::Relaxed),
