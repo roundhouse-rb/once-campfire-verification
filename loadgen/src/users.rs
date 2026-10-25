@@ -179,6 +179,8 @@ struct Step {
     delivered: u64,
     /// Requests that got no response, by route and reason.
     errors: BTreeMap<String, u64>,
+    /// Subscribe commands sent again because no confirmation came within 500 ms, by channel.
+    resubscribes: BTreeMap<String, u64>,
 }
 
 struct Stats {
@@ -192,6 +194,8 @@ struct Stats {
     rejected: AtomicU64,
     /// Subscribe commands sent again because no confirmation came within 500 ms.
     resubscribes: AtomicU64,
+    /// The step being measured (None while warming up or between steps), for counters with no Action to carry it.
+    current_step: Mutex<Option<usize>>,
     /// Keep-alive connections found closed by the server before a request was sent, and replaced.
     reconnects: AtomicU64,
     presence_writes: AtomicU64,
@@ -920,6 +924,13 @@ async fn guarantee_subscriptions(ctx: Arc<Ctx>, v: Arc<Viewer>) {
         for ident in due {
             if ctx.ws_send(&v, json!({"command": "subscribe", "identifier": ident}).to_string()).await {
                 ctx.stats.resubscribes.fetch_add(1, Ordering::Relaxed);
+                if let Some(s) = *ctx.stats.current_step.lock().unwrap() {
+                    let channel = serde_json::from_str::<Value>(&ident)
+                        .ok()
+                        .and_then(|v| v["channel"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    *ctx.stats.steps[s].lock().unwrap().resubscribes.entry(channel).or_default() += 1;
+                }
             }
         }
     }
@@ -1043,6 +1054,7 @@ pub async fn users(a: &Args) -> Res<Value> {
             rejected: AtomicU64::new(0),
             presence_writes: AtomicU64::new(0),
             resubscribes: AtomicU64::new(0),
+            current_step: Mutex::new(None),
             reconnects: AtomicU64::new(0),
         },
         known: Mutex::new(Known { room_of, newest: HashMap::new(), deferred: Vec::new(), audit: Vec::new(), unacknowledged: Vec::new() }),
@@ -1128,6 +1140,8 @@ pub async fn users(a: &Args) -> Res<Value> {
         let before = active.load(Ordering::Relaxed);
         if sp.people > before {
             phase(&format!("arrive {before}..{}", sp.people));
+            // Arrivals are untimed; what they cost is not charged to the step before them.
+            *ctx.stats.current_step.lock().unwrap() = None;
             let arrive_start = Instant::now();
             for v in &viewers[before..sp.people] {
                 let weights: Vec<f64> = v.rooms.iter().map(room_weight).collect();
@@ -1194,6 +1208,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         let rate = sp.navigations_per_sec;
         phase(&format!("step {} {people} people {rate}/s", step.map_or("warmup".to_string(), |s| s.to_string())));
         *current_step.lock().unwrap() = step;
+        *ctx.stats.current_step.lock().unwrap() = step;
         writer_rate.store(sp.writes_per_sec.to_bits(), Ordering::Relaxed);
         let started = Instant::now();
         let cpu_at_start = own_cpu_secs();
@@ -1369,6 +1384,7 @@ pub async fn users(a: &Args) -> Res<Value> {
                 "meets_slo": navigation_ok && delivery_ok,
                 "routes": routes,
                 "errors": s.errors,
+                "resubscribes": s.resubscribes,
                 "delivery": {
                     "expected": s.expected_deliveries,
                     "received": s.delivered,
