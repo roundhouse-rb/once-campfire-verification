@@ -164,6 +164,8 @@ impl Route {
 #[derive(Default)]
 struct Step {
     offered: f64,
+    /// The load generator's own CPU over the step, in seconds (user + system, every thread).
+    generator_cpu_secs: f64,
     people: usize,
     writes: f64,
     seconds: f64,
@@ -1166,6 +1168,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         *current_step.lock().unwrap() = step;
         writer_rate.store(sp.writes_per_sec.to_bits(), Ordering::Relaxed);
         let started = Instant::now();
+        let cpu_at_start = own_cpu_secs();
         let end = started + Duration::from_secs_f64(secs);
         let mut next = started;
         let mut navigations = 0u64;
@@ -1201,6 +1204,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         if let Some(s) = step {
             let mut st = ctx.stats.steps[s].lock().unwrap();
             st.seconds = secs;
+            st.generator_cpu_secs = own_cpu_secs() - cpu_at_start;
             st.navigations = navigations;
             drop(st);
             completed_steps = s + 1;
@@ -1323,6 +1327,8 @@ pub async fn users(a: &Args) -> Res<Value> {
                 "people": s.people,
                 "offered_writes_per_sec": s.writes,
                 "offered_navigations_per_sec": s.offered,
+                // Percent of one core; compare with generator_cpus to see how close the generator came to its limit.
+                "generator_cpu_percent": 100.0 * s.generator_cpu_secs / s.seconds.max(1e-9),
                 "seconds": s.seconds,
                 "navigations_scheduled": s.navigations,
                 "navigations_completed_per_sec": all.len() as f64 / s.seconds.max(1e-9),
@@ -1370,6 +1376,7 @@ pub async fn users(a: &Args) -> Res<Value> {
         "capacity_people": capacity_people,
         "stopped_early": stopped_early,
         "generator_lag": summary(&lag),
+        "generator_cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
         "steps": steps,
         "errors": errors,
         "invalid": invalid,
@@ -1448,6 +1455,17 @@ fn audit_db(db: &str, ctx: &Ctx) -> Res<DbAudit> {
         "sent_without_acknowledgement": known.unacknowledged.len(),
     });
     Ok((value, committed, failures))
+}
+
+/// This process's CPU time so far, user plus system across all threads, from /proc/self/stat (Linux; 0 elsewhere).
+/// Reported per step so a reader can see how much of its cores the generator itself used.
+fn own_cpu_secs() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return 0.0 };
+    // Fields after the parenthesized command name: utime and stime are the 12th and 13th (fields 14 and 15).
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 2..]) else { return 0.0 };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let ticks: f64 = [11, 12].iter().filter_map(|&i| fields.get(i)?.parse::<f64>().ok()).sum();
+    ticks / 100.0 // USER_HZ, 100 on Linux
 }
 
 #[cfg(test)]
